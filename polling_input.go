@@ -13,7 +13,7 @@
 #
 # ***** END LICENSE BLOCK *****/
 
-package dir
+package heka_sftp_polling_input
 
 import (
 	"archive/tar"
@@ -43,7 +43,6 @@ type SftpPollingInput struct {
 
 type SftpPollingInputConfig struct {
 	TickerInterval uint   `toml:"ticker_interval"`
-	DirPath        string `toml:"dir_path"`
 	Repeat         bool   `toml:"repeat"`
 	RepeatMarkDir  string `toml:"repeat_mark_dir"`
 	Suffix         string `toml:"suffix"`
@@ -61,6 +60,7 @@ func (input *SftpPollingInput) ConfigStruct() interface{} {
 		TickerInterval: uint(5),
 		Repeat:         false,
 		MaxPacket:      1 << 15,
+		Port:           22,
 		RepeatMarkDir:  "dir_polling_input_repeat_mark",
 	}
 }
@@ -122,75 +122,83 @@ func (input *SftpPollingInput) Run(runner pipeline.InputRunner,
 		}
 
 		runner.LogMessage("start polling from sftp")
+		if err := input.polling(func(f io.ReadSeeker, name string) error {
+			return input.read(f, name, runner)
+		}); err != nil {
+			runner.LogError(err)
+			return nil
+		}
+	}
+}
 
-		if infos, err := input.client.ReadDir(input.Dir); err == nil {
-			for _, info := range infos {
-				if (!info.IsDir()) && (input.SftpPollingInputConfig.Suffix == "" || strings.HasSuffix(info.Name(), input.SftpPollingInputConfig.Suffix)) {
-					mark := filepath.Join(input.SftpPollingInputConfig.RepeatMarkDir, input.Dir, info.Name()+".ok")
-					if !input.SftpPollingInputConfig.Repeat {
-						if _, err := os.Stat(mark); !os.IsNotExist(err) {
-							runner.LogMessage("repeat file " + info.Name())
-							return nil
-						}
-					}
-
-					dir := filepath.Dir(mark)
-					if err = os.MkdirAll(dir, 0664); err != nil {
-						runner.LogError(fmt.Errorf("Error opening file: %s", err.Error()))
-						return nil
-					} else {
-						if err := ioutil.WriteFile(mark, []byte(time.Now().String()), 0664); err != nil {
-							runner.LogError(err)
-							return nil
-						}
-					}
-
-					f, err := input.client.Open(filepath.Join(input.Dir, info.Name()))
-
-					if err != nil {
-						runner.LogError(fmt.Errorf("Error opening file: %s", err.Error()))
-						return nil
-					}
-
-					defer f.Close()
-
-					sRunner := runner.NewSplitterRunner(info.Name())
-					if !sRunner.UseMsgBytes() {
-						sRunner.SetPackDecorator(func(pack *pipeline.PipelinePack) {
-							pack.Message.SetType("heka.sftp.polling")
-							pack.Message.SetHostname(input.hostname)
-							if field, err := message.NewField("file_name", info.Name(), ""); err == nil {
-								pack.Message.AddField(field)
-							}
-							return
-						})
-					}
-
-					if input.SftpPollingInputConfig.Compress && input.SftpPollingInputConfig.Suffix == ".gz" {
-
-						var fileReader *gzip.Reader
-						if fileReader, err = gzip.NewReader(f); err == nil {
-							defer fileReader.Close()
-							tarBallReader := tar.NewReader(fileReader)
-							for {
-								if header, err := tarBallReader.Next(); err == nil {
-									// get the individual filename and extract to the current directory
-									switch header.Typeflag {
-									case tar.TypeReg:
-										split(runner, sRunner, tarBallReader)
-									}
-								} else {
-									break
-								}
-							}
-						}
-					} else {
-						split(runner, sRunner, f)
+func (input *SftpPollingInput) polling(fn func(io.ReadSeeker, string) error) error {
+	if infos, err := input.client.ReadDir(input.Dir); err == nil {
+		for _, info := range infos {
+			if (!info.IsDir()) && (input.SftpPollingInputConfig.Suffix == "" || strings.HasSuffix(info.Name(), input.SftpPollingInputConfig.Suffix)) {
+				mark := filepath.Join(input.SftpPollingInputConfig.RepeatMarkDir, input.Dir, info.Name()+".ok")
+				if !input.SftpPollingInputConfig.Repeat {
+					if _, err := os.Stat(mark); !os.IsNotExist(err) {
+						return fmt.Errorf("repeat file %s", info.Name())
 					}
 				}
+				dir := filepath.Dir(mark)
+				if err = os.MkdirAll(dir, 0774); err != nil {
+					return fmt.Errorf("Error opening file: %s", err.Error())
+				} else {
+					if err := ioutil.WriteFile(mark, []byte(time.Now().String()), 0664); err != nil {
+						return err
+					}
+				}
+
+				f, err := input.client.Open(filepath.Join(input.Dir, info.Name()))
+
+				if err != nil {
+					return fmt.Errorf("Error opening remote file: %s", err.Error())
+				}
+
+				defer f.Close()
+				err = fn(f, info.Name())
 			}
 		}
 	}
+	return nil
+}
+
+func (input *SftpPollingInput) read(file io.ReadSeeker, name string, runner pipeline.InputRunner) (err error) {
+	sRunner := runner.NewSplitterRunner(name)
+	if !sRunner.UseMsgBytes() {
+		sRunner.SetPackDecorator(func(pack *pipeline.PipelinePack) {
+			pack.Message.SetType("heka.sftp.polling")
+			pack.Message.SetHostname(input.hostname)
+			if field, err := message.NewField("file_name", name, ""); err == nil {
+				pack.Message.AddField(field)
+			}
+			return
+		})
+	}
+
+	if input.SftpPollingInputConfig.Compress && input.SftpPollingInputConfig.Suffix == ".gz" {
+
+		var fileReader *gzip.Reader
+		if fileReader, err = gzip.NewReader(file); err == nil {
+			defer fileReader.Close()
+			tarBallReader := tar.NewReader(fileReader)
+			for {
+				if header, err := tarBallReader.Next(); err == nil {
+					// get the individual filename and extract to the current directory
+					switch header.Typeflag {
+					case tar.TypeReg:
+						split(runner, sRunner, tarBallReader)
+					}
+				} else {
+					break
+				}
+			}
+		}
+	} else {
+		split(runner, sRunner, file)
+	}
+	return
 }
 
 func split(runner pipeline.InputRunner, sRunner pipeline.SplitterRunner, reader io.Reader) {
